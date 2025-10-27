@@ -1,17 +1,17 @@
-# 🛰️ MassBeacon
+# MassBeacon
 
 **MassBeacon** is a RuneLite plugin designed to help players find active worlds for otherwise “dead content” — minigames and activities that often lack players. By broadcasting and collecting real-time data from users, MassBeacon provides a simple way to see where the action is happening.
 
 ---
 
-## 🧠 Overview
+## Overview
 
 Many Old School RuneScape activities suffer from low player participation — Barbarian Assault, Corporeal Beast, and others can be tough to find teams for.  
 MassBeacon aims to fix that by creating a lightweight “activity beacon” system powered by a shared backend. Players using the plugin can see which worlds currently have other players doing the same activity, helping groups form organically.
 
 ---
 
-## ⚙️ How It Works
+## How It Works
 
 - When a player enters a supported activity area, the plugin **pings** the MassBeacon backend.
 - The backend aggregates activity data and serves it to all clients.
@@ -22,17 +22,17 @@ Example:
 
 ---
 
-## 🧩 Features
+## Features
 
-- 🧭 Automatic activity detection (e.g., Barbarian Assault, Corp Beast)
-- 🌍 Real-time world aggregation
-- 🕒 Lightweight (no persistent storage or user tracking)
-- ⚡ Built for RuneLite
-- 🔒 Privacy-safe (no personal data, only world/activity pings)
+- Automatic activity detection (e.g., Barbarian Assault, Corp Beast)
+- Real-time world aggregation
+- Lightweight (no persistent storage or user tracking)
+- Built for RuneLite
+- Privacy-safe (no personal data, only world/activity pings)
 
 ---
 
-## 💻 Built With
+## Built With
 
 - **Java** (RuneLite Plugin Framework)
 - **Cloudflare Workers** backend (KV-based key/value store)
@@ -40,7 +40,7 @@ Example:
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 
