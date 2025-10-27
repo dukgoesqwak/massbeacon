@@ -22,6 +22,7 @@ import net.runelite.api.GameState;
 import net.runelite.api.Player;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
@@ -47,7 +48,7 @@ public class MassBeaconPlugin extends Plugin
     private static final boolean AUTO_POST_ENABLED = true;
     private static final boolean NETWORK_BEACONS_ENABLED = true;
     private static final boolean INCLUDE_PLAYER_COUNT = true;
-    private static final int AUTO_POST_INTERVAL_SEC = 15; // 🔁 Slow down posts to avoid KV flicker
+    private static final int AUTO_POST_INTERVAL_SEC = 15; // post cadence
 
     private static final URI BEACON_ENDPOINT = URI.create(
             "https://massbeacon-worker.dskill4.workers.dev/beacon"
@@ -74,7 +75,13 @@ public class MassBeaconPlugin extends Plugin
 
     private String lastDiscordSig = null;
     private Instant lastDiscordAt = Instant.EPOCH;
+
+    // region tracking
     volatile int lastRegionId = -1;
+    private int lastLoggedRegion = -1;
+
+    // track whether we are currently inside the target area (for clearing overlay when we leave)
+    private boolean wasInTargetArea = false;
 
     private static final String CFG_GROUP = "massbeacon";
     private static final String[] DEPRECATED_KEYS = {
@@ -84,7 +91,11 @@ public class MassBeaconPlugin extends Plugin
             "corpRegionIds"
     };
 
-    private static final int[] BA_REGIONS   = { 7508, 7509, 7510, 7764, 7765, 7766 };
+    // ✅ Updated BA regions based on your logs
+    //  - 10322: BA outpost / lobby area
+    //  - 10039: outside BA (adjacent area you crossed)
+    private static final int[] BA_REGIONS   = { 10322, 10039 };
+    // Leave Corp as-is (can update when you share its regions)
     private static final int[] CORP_REGIONS = { 11842, 11844 };
 
     @Provides
@@ -94,7 +105,6 @@ public class MassBeaconPlugin extends Plugin
     protected void startUp()
     {
         for (String k : DEPRECATED_KEYS) { configManager.unsetConfiguration(CFG_GROUP, k); }
-
         overlayManager.add(overlay);
 
         if (NETWORK_BEACONS_ENABLED) scheduleFetch();
@@ -111,9 +121,39 @@ public class MassBeaconPlugin extends Plugin
         latestWorlds = Collections.emptyList();
         lastDiscordSig = null;
         lastDiscordAt = Instant.EPOCH;
-
         overlayManager.remove(overlay);
         log.info("MassBeacon stopped.");
+    }
+
+    // ---------- Region change logger + leave detection ----------
+    @Subscribe
+    public void onGameTick(GameTick e)
+    {
+        if (client.getLocalPlayer() == null) return;
+        WorldPoint wp = client.getLocalPlayer().getWorldLocation();
+        if (wp == null) return;
+
+        int r = wp.getRegionID();
+        lastRegionId = r;
+
+        if (r != lastLoggedRegion)
+        {
+            lastLoggedRegion = r;
+            log.info("MassBeacon: region change -> region={} x={} y={} plane={} inBA={} inCorp={}",
+                    r, wp.getX(), wp.getY(), wp.getPlane(), rawIsInBA(r), rawIsInCorp(r));
+        }
+
+        // Detect entering/exiting target area and clear overlay on exit
+        boolean inAreaNow = resolveActivityOrNull() != null;
+        if (inAreaNow != wasInTargetArea)
+        {
+            if (!inAreaNow && !latestWorlds.isEmpty())
+            {
+                latestWorlds = Collections.emptyList();
+                log.info("MassBeacon: left target area (region={}), overlay cleared", lastRegionId);
+            }
+            wasInTargetArea = inAreaNow;
+        }
     }
 
     // ---------- One-shot POST/FETCH on login ----------
@@ -128,25 +168,22 @@ public class MassBeaconPlugin extends Plugin
 
     private void debugImmediatePostAndFetch()
     {
-        if (!isReadyInGame())
+        if (!isReadyInGame()) return;
+
+        final String activity = resolveActivityOrNull();
+        if (activity == null)
         {
-            log.debug("MassBeacon: skip immediate post (not ready in game)");
+            log.info("MassBeacon: immediate tick outside target area; skipping post/fetch (region={})", lastRegionId);
             return;
         }
-        if (!isInAllowedArea())
-        {
-            log.debug("MassBeacon: skip immediate post (area gate)");
-        }
 
-        final String activity = inferActivity();
         final int world = client.getWorld();
         final int players = getPlayerCount();
 
-        log.info("MassBeacon: IMMEDIATE POST test -> activity='{}' world={} players={}", activity, world, players);
+        log.info("MassBeacon: IMMEDIATE POST -> '{}' W{} players={}", activity, world, players);
         doPost(activity, world, players, shouldNotifyDiscord(activity, world, players));
 
-        log.info("MassBeacon: IMMEDIATE FETCH test");
-        doFetch();
+        doFetch(activity); // fetch the same activity immediately
     }
 
     // ---------- Scheduling ----------
@@ -174,10 +211,10 @@ public class MassBeaconPlugin extends Plugin
     {
         try
         {
-            if (!isReadyInGame()) { log.trace("MassBeacon: fetch skip (not ready)"); return; }
-            log.trace("MassBeacon: region {}", lastRegionId);
-            if (!isInAllowedArea()) { log.trace("MassBeacon: fetch skip (area gate)"); return; }
-            doFetch();
+            if (!isReadyInGame()) return;
+            final String activity = resolveActivityOrNull();
+            if (activity == null) return;
+            doFetch(activity);
         }
         catch (Exception e) { log.debug("Fetch failed", e); }
     }
@@ -186,14 +223,16 @@ public class MassBeaconPlugin extends Plugin
     {
         try
         {
-            if (!isReadyInGame() || !isInAllowedArea()) return;
+            if (!isReadyInGame()) return;
 
-            final String activity = inferActivity();
+            final String activity = resolveActivityOrNull();
+            if (activity == null) return; // hard stop outside area
+
             final int world = client.getWorld();
             final int players = getPlayerCount();
             final boolean notifyDiscord = shouldNotifyDiscord(activity, world, players);
 
-            log.debug("MassBeacon: POST tick -> activity='{}' world={} players={} notifyDiscord={}",
+            log.debug("MassBeacon: POST tick -> '{}' W{} players={} notifyDiscord={}",
                     activity, world, players, notifyDiscord);
 
             doPost(activity, world, players, notifyDiscord);
@@ -248,9 +287,9 @@ public class MassBeaconPlugin extends Plugin
                         postToDiscordAsync(activity, world, playerCount);
                     }
 
-                    // 🔁 Immediately fetch to refresh overlay data
+                    // Immediately fetch to refresh overlay data for the same activity
                     executor.execute(() -> {
-                        try { doFetch(); } catch (Exception ignored) {}
+                        try { doFetch(activity); } catch (Exception ignored) {}
                     });
                 }
             });
@@ -261,12 +300,10 @@ public class MassBeaconPlugin extends Plugin
         }
     }
 
-    private void doFetch()
+    private void doFetch(String activity)
     {
         try
         {
-            String activity = inferActivity();
-
             HttpUrl url = new HttpUrl.Builder()
                     .scheme("https")
                     .host("massbeacon-worker.dskill4.workers.dev")
@@ -298,7 +335,7 @@ public class MassBeaconPlugin extends Plugin
                     class Summary { List<WorldCount> worlds; }
                     Summary s = GSON.fromJson(body, Summary.class);
 
-                    // ⛑️ Do NOT overwrite overlay with empty results (KV may be briefly empty)
+                    // Do NOT overwrite overlay with empty results (KV may be briefly empty)
                     if (s == null || s.worlds == null)
                     {
                         log.info("MassBeacon: summary parse -> null (keeping previous)");
@@ -357,56 +394,63 @@ public class MassBeaconPlugin extends Plugin
         return m;
     }
 
-    private boolean isInAllowedArea()
+    /**
+     * Only operate when actually in the target area (per toggles + region list).
+     * Returns null outside area.
+     */
+    private String resolveActivityOrNull()
     {
-        final boolean wantBA = config.onlyAtBA();
+        final boolean wantBA   = config.onlyAtBA();
         final boolean wantCorp = config.onlyAtCorp();
-        if (!wantBA && !wantCorp) return true;
+        final boolean inBA     = isInBARegion();
+        final boolean inCorp   = isInCorpRegion();
 
-        final boolean inBA = isInBARegion();
-        final boolean inCorp = isInCorpRegion();
+        if (wantBA && inBA)     return "Barbarian Assault";
+        if (wantCorp && inCorp) return "Corporeal Beast";
 
-        if ((wantBA && inBA) || (wantCorp && inCorp)) return true;
-        return true; // temporary fail-open
-    }
-
-    private String inferActivity()
-    {
-        boolean inBA   = isInBARegion();
-        boolean inCorp = isInCorpRegion();
-
-        if (config.onlyAtBA() && config.onlyAtCorp())
+        if (!wantBA && !wantCorp)
         {
             if (inBA)   return "Barbarian Assault";
             if (inCorp) return "Corporeal Beast";
         }
-
-        if (config.onlyAtBA())   return "Barbarian Assault";
-        if (config.onlyAtCorp()) return "Corporeal Beast";
-
-        if (inBA)   return "Barbarian Assault";
-        if (inCorp) return "Corporeal Beast";
-        return "Custom";
+        return null;
     }
 
     private boolean isInBARegion()
     {
-        WorldPoint wp = client.getLocalPlayer() != null ? client.getLocalPlayer().getWorldLocation() : null;
-        if (wp == null) return false;
-        int r = wp.getRegionID();
-        lastRegionId = r;
+        int r = currentRegionId();
+        if (r == -1) return false;
         for (int id : BA_REGIONS) if (r == id) return true;
         return false;
     }
 
     private boolean isInCorpRegion()
     {
-        WorldPoint wp = client.getLocalPlayer() != null ? client.getLocalPlayer().getWorldLocation() : null;
-        if (wp == null) return false;
-        int r = wp.getRegionID();
-        lastRegionId = r;
+        int r = currentRegionId();
+        if (r == -1) return false;
         for (int id : CORP_REGIONS) if (r == id) return true;
         return false;
+    }
+
+    private boolean rawIsInBA(int regionId)
+    {
+        for (int id : BA_REGIONS) if (regionId == id) return true;
+        return false;
+    }
+
+    private boolean rawIsInCorp(int regionId)
+    {
+        for (int id : CORP_REGIONS) if (regionId == id) return true;
+        return false;
+    }
+
+    private int currentRegionId()
+    {
+        if (client.getLocalPlayer() == null) return -1;
+        WorldPoint wp = client.getLocalPlayer().getWorldLocation();
+        if (wp == null) return -1;
+        lastRegionId = wp.getRegionID();
+        return lastRegionId;
     }
 
     private boolean isReadyInGame()
